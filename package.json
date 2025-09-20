@@ -1,0 +1,30 @@
+{
+  "scripts": {
+    "dev": "bun --watch server.ts",
+    "start": "bun run server.ts",
+    "build": "bun build server.ts --outdir ./dist",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "cors": "^2.8.5",
+    "dockerode": "^4.0.8",
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/bun": "latest",
+    "@types/cors": "^2.8.19",
+    "@types/dockerode": "^3.3.44",
+    "@types/express": "^5.0.3",
+    "@types/multer": "^2.0.0",
+    "@types/ws": "^8.18.1"
+  },
+  "name": "selfhost-discordbot-api",
+  "private": true,
+  "peerDependencies": {
+    "typescript": "^5.9.2"
+  }
+}
