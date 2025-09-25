@@ -31,7 +31,6 @@ export async function createAndRunBotContainer(botDir: string, botId: string) {
       { t: imageName }
     );
 
-    // Buildar imagem
     await new Promise<void>((resolve, reject) => {
       docker.modem.followProgress(tarStream, (err, output) => {
         if (err)
@@ -41,14 +40,13 @@ export async function createAndRunBotContainer(botDir: string, botId: string) {
       });
     });
 
-    // Criação do container
     const container = await docker.createContainer({
       Labels: { userId: "123", botId: `${botId}` },
       name: containerName,
       Image: imageName,
       HostConfig: {
-        Memory: 256 * 1024 * 1024, // 256MB
-        NanoCpus: 0.5 * 1e9, // 0.5 CPU
+        Memory: 256 * 1024 * 1024,
+        NanoCpus: 0.5 * 1e9,
       },
     });
 

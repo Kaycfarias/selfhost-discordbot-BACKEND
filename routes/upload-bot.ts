@@ -10,6 +10,63 @@ const upload = multer({ dest: "uploads/" });
 
 import type { Request, Response } from "express";
 
+/**
+ * @swagger
+ * /api/upload-bot:
+ *   post:
+ *     summary: Faz upload de um bot Discord via arquivo ZIP
+ *     tags: [Bots]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               BotZip:
+ *                 type: string
+ *                 format: binary
+ *                 description: Arquivo ZIP contendo main.py e requirements.txt
+ *     responses:
+ *       200:
+ *         description: Upload realizado com sucesso
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 message:
+ *                   type: string
+ *                 botId:
+ *                   type: string
+ *       400:
+ *         description: Erro de validação (arquivo não é ZIP, falta main.py ou requirements.txt)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ *       500:
+ *         description: Erro interno ou problema com Docker
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ *       503:
+ *         description: Erro no Docker
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ */
 router.post(
   "/upload-bot",
   upload.single("BotZip"),

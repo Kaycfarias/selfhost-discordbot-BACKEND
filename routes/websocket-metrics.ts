@@ -1,7 +1,3 @@
-/**
- * WebSocket Métricas
- */
-
 import { metricsWSS } from "../websocket-servers";
 import Docker from "dockerode";
 import { IncomingMessage } from "http";

@@ -25,7 +25,6 @@ terminalWSS.on("connection", async (ws: WebSocket, req) => {
     const { State } = await container.inspect();
     const isRunning = State.Running;
 
-    // 🔹 Enviar logs recentes (últimos 100)
     await sendRecentLogs(container, ws);
 
     if (!isRunning) {
@@ -33,7 +32,6 @@ terminalWSS.on("connection", async (ws: WebSocket, req) => {
       return ws.close();
     }
 
-    // 🔹 Iniciar streaming ao vivo
     await streamLiveLogs(container, ws);
   } catch (err: any) {
     ws.send(`[Erro] Não foi possível acessar o container: ${err.message}`);
