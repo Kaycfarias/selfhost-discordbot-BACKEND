@@ -83,7 +83,7 @@ async function streamLiveLogs(container: Docker.Container, ws: WebSocket) {
 
   container.wait().then(() => {
     if (ws.readyState === ws.OPEN) {
-      ws.send("[Bot parado]");
+      ws.send("[Bot parado]\n\r\n\r\n");
       ws.close();
     }
   });
