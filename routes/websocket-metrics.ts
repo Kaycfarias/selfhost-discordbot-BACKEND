@@ -5,7 +5,7 @@ import { Socket } from "net";
 import { Readable } from "stream";
 import type { WebSocket } from "ws";
 
-interface IContainerMetrics {
+interface ContainerMetrics {
   botId: string;
   timestamp: string;
   cpuPercent: string;
@@ -18,321 +18,309 @@ interface IContainerMetrics {
   uptime: string;
 }
 
-interface IErrorMessage {
-  error: string;
-  timestamp: string;
+function formatUptime(startedAt: string): string {
+  if (!startedAt) return "0h 0m";
+  const diff = Date.now() - new Date(startedAt).getTime();
+  const hours = Math.floor(diff / (1000 * 60 * 60));
+  const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+  return `${hours}h ${minutes}m`;
 }
 
-interface IMetricsProcessor {
-  processRawData(
-    rawData: any,
-    botId: string,
-    containerInfo: any
-  ): IContainerMetrics;
+function isWebSocketOpen(ws: WebSocket): boolean {
+  return ws.readyState === ws.OPEN;
 }
 
-interface IConnectionManager {
-  handleConnection(ws: WebSocket, botId: string): Promise<void>;
-  cleanup(): void;
+function sendError(ws: WebSocket, message: string): void {
+  if (!isWebSocketOpen(ws)) return;
+  ws.send(
+    JSON.stringify({ error: message, timestamp: new Date().toISOString() })
+  );
 }
 
-interface IWebSocketUtils {
-  sendError(ws: WebSocket, message: string): void;
-  sendMetrics(ws: WebSocket, metrics: IContainerMetrics): void;
-  isOpen(ws: WebSocket): boolean;
+function sendMetrics(ws: WebSocket, metrics: ContainerMetrics): void {
+  if (!isWebSocketOpen(ws)) return;
+  ws.send(JSON.stringify(metrics));
 }
 
-class TimeUtils {
-  static formatUptime(startedAt: string): string {
-    const start = new Date(startedAt);
-    const now = new Date();
-    const diff = now.getTime() - start.getTime();
+function processMetrics(
+  rawData: any,
+  botId: string,
+  containerInfo: any
+): ContainerMetrics {
+  // CPU
+  const cpuDelta =
+    rawData.cpu_stats.cpu_usage.total_usage -
+    (rawData.precpu_stats.cpu_usage?.total_usage || 0);
+  const systemCpuDelta =
+    rawData.cpu_stats.system_cpu_usage -
+    (rawData.precpu_stats.system_cpu_usage || 0);
+  const cpuPercent =
+    systemCpuDelta > 0 && cpuDelta >= 0
+      ? (cpuDelta / systemCpuDelta) * (rawData.cpu_stats.online_cpus || 1) * 100
+      : 0;
 
-    const hours = Math.floor(diff / (1000 * 60 * 60));
-    const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+  // Memória
+  const memoryUsage = rawData.memory_stats.usage || 0;
+  // Se o container estiver desligado, tente obter o limite de memória do containerInfo
+  const memoryLimit =
+    rawData.memory_stats.limit || containerInfo?.HostConfig?.Memory || 0;
+  const memoryPercent = memoryLimit > 0 ? (memoryUsage / memoryLimit) * 100 : 0;
 
-    return `${hours}h ${minutes}m`;
-  }
+  // Rede
+  const networks = rawData.networks || {};
+  let networkRx = 0,
+    networkTx = 0;
+  Object.values(networks).forEach((network: any) => {
+    networkRx += network.rx_bytes || 0;
+    networkTx += network.tx_bytes || 0;
+  });
 
-  static getCurrentTimestamp(): string {
-    return new Date().toISOString();
-  }
+  return {
+    botId,
+    timestamp: new Date().toISOString(),
+    cpuPercent: cpuPercent.toFixed(2),
+    memoryUsage,
+    memoryLimit,
+    memoryPercent: memoryPercent.toFixed(2),
+    networkRx,
+    networkTx,
+    status: containerInfo?.State?.Status || "unknown",
+    uptime: formatUptime(containerInfo?.State?.StartedAt || ""),
+  };
 }
 
-class WebSocketUtils implements IWebSocketUtils {
-  sendError(ws: WebSocket, message: string): void {
-    if (!this.isOpen(ws)) return;
-
-    const errorMsg: IErrorMessage = {
-      error: message,
-      timestamp: TimeUtils.getCurrentTimestamp(),
-    };
-    ws.send(JSON.stringify(errorMsg));
+const docker = new Docker();
+const activeConnections = new Map<
+  string,
+  {
+    ws: WebSocket;
+    statsStream?: Readable;
+    eventsStream?: Readable;
+    pingInterval?: NodeJS.Timeout;
+    containerInfo?: any;
   }
+>();
 
-  sendMetrics(ws: WebSocket, metrics: IContainerMetrics): void {
-    if (!this.isOpen(ws)) return;
-    ws.send(JSON.stringify(metrics));
-  }
-
-  isOpen(ws: WebSocket): boolean {
-    return ws.readyState === ws.OPEN;
-  }
-}
-
-class ContainerMetricsProcessor implements IMetricsProcessor {
-  processRawData(
-    rawData: any,
-    botId: string,
-    containerInfo: any
-  ): IContainerMetrics {
-    const cpuMetrics = this.calculateCpuMetrics(rawData);
-    const memoryMetrics = this.calculateMemoryMetrics(rawData);
-    const networkMetrics = this.calculateNetworkMetrics(rawData);
-
-    return {
-      botId,
-      timestamp: TimeUtils.getCurrentTimestamp(),
-      cpuPercent: cpuMetrics.toFixed(2),
-      memoryUsage: memoryMetrics.usage,
-      memoryLimit: memoryMetrics.limit,
-      memoryPercent: memoryMetrics.percent.toFixed(2),
-      networkRx: networkMetrics.rx,
-      networkTx: networkMetrics.tx,
-      status: containerInfo.State.Status || "unknown",
-      uptime: TimeUtils.formatUptime(containerInfo.State.StartedAt || ""),
-    };
-  }
-
-  private calculateCpuMetrics(rawData: any): number {
-    const cpuDelta =
-      rawData.cpu_stats.cpu_usage.total_usage -
-      (rawData.precpu_stats.cpu_usage?.total_usage || 0);
-    const systemCpuDelta =
-      rawData.cpu_stats.system_cpu_usage -
-      (rawData.precpu_stats.system_cpu_usage || 0);
-
-    if (systemCpuDelta <= 0 || cpuDelta < 0) return 0;
-
-    return (
-      (cpuDelta / systemCpuDelta) * (rawData.cpu_stats.online_cpus || 1) * 100
-    );
-  }
-
-  private calculateMemoryMetrics(rawData: any): {
-    usage: number;
-    limit: number;
-    percent: number;
-  } {
-    const usage = rawData.memory_stats.usage || 0;
-    const limit = rawData.memory_stats.limit || 0;
-    const percent = limit > 0 ? (usage / limit) * 100 : 0;
-
-    return { usage, limit, percent };
-  }
-
-  private calculateNetworkMetrics(rawData: any): { rx: number; tx: number } {
-    const networks = rawData.networks || {};
-    let rx = 0;
-    let tx = 0;
-
-    Object.values(networks).forEach((network: any) => {
-      rx += network.rx_bytes || 0;
-      tx += network.tx_bytes || 0;
-    });
-
-    return { rx, tx };
-  }
-}
-
-class MetricsConnectionManager implements IConnectionManager {
-  private docker: Docker;
-  private metricsProcessor: IMetricsProcessor;
-  private webSocketUtils: IWebSocketUtils;
-  private statsStream: Readable | null = null;
-  private metricsInterval: NodeJS.Timeout | null = null;
-
-  constructor(
-    docker: Docker,
-    metricsProcessor: IMetricsProcessor,
-    webSocketUtils: IWebSocketUtils
-  ) {
-    this.docker = docker;
-    this.metricsProcessor = metricsProcessor;
-    this.webSocketUtils = webSocketUtils;
-  }
-
-  async handleConnection(ws: WebSocket, botId: string): Promise<void> {
-    console.log(`📊 WebSocket métricas conectado para bot: ${botId}`);
-
-    try {
-      const container = this.docker.getContainer(`bot-${botId}-container`);
-      const containerInfo = await this.validateContainer(ws, container);
-
-      if (!containerInfo) return;
-
-      await this.initializeMetricsStream(ws, container, botId, containerInfo);
-      this.setupConnectionHandlers(ws, botId);
-    } catch (error: any) {
-      console.error(`🚨 Erro ao iniciar métricas para bot ${botId}:`, error);
-      this.webSocketUtils.sendError(
-        ws,
-        `Container não encontrado: ${error.message}`
-      );
-      ws.close();
-    }
-  }
-
-  private async validateContainer(
-    ws: WebSocket,
-    container: Docker.Container
-  ): Promise<any | null> {
+async function handleMetricsConnection(
+  ws: WebSocket,
+  botId: string
+): Promise<void> {
+  try {
+    const container = docker.getContainer(`bot-${botId}-container`);
     const containerInfo = await container.inspect();
 
-    if (!containerInfo.State.Running) {
-      this.webSocketUtils.sendError(ws, "Container não está rodando");
+    if (!containerInfo?.State?.Status) {
+      sendError(ws, "Container não encontrado");
       ws.close();
-      return null;
+      return;
     }
 
-    return containerInfo;
-  }
+    const connection = {
+      ws,
+      containerInfo,
+      statsStream: undefined as Readable | undefined,
+      eventsStream: undefined as Readable | undefined,
+      pingInterval: undefined as NodeJS.Timeout | undefined,
+    };
+    activeConnections.set(botId, connection);
 
-  private async initializeMetricsStream(
-    ws: WebSocket,
-    container: Docker.Container,
-    botId: string,
-    containerInfo: any
-  ): Promise<void> {
-    const rawStream = await container.stats({ stream: true });
-    this.statsStream = rawStream as Readable;
+    await startMetricsStream(botId, container);
+    await startDockerEventsStream(botId, containerInfo.Id);
 
-    this.statsStream.on("data", (chunk: Buffer) => {
-      this.handleMetricsData(ws, chunk, botId, containerInfo);
-    });
-
-    this.statsStream.on("error", (err) => {
-      console.error(`Erro na stream para bot ${botId}:`, err);
-      if (this.webSocketUtils.isOpen(ws)) {
-        this.webSocketUtils.sendError(ws, "Erro na stream de métricas");
-        ws.close();
-      }
-    });
-  }
-
-  private handleMetricsData(
-    ws: WebSocket,
-    chunk: Buffer,
-    botId: string,
-    containerInfo: any
-  ): void {
-    try {
-      const rawData = JSON.parse(chunk.toString());
-      const metrics = this.metricsProcessor.processRawData(
-        rawData,
-        botId,
-        containerInfo
-      );
-
-      this.webSocketUtils.sendMetrics(ws, metrics);
-    } catch (parseError) {
-      console.error("Erro ao processar métricas:", parseError);
-      if (this.webSocketUtils.isOpen(ws)) {
-        this.webSocketUtils.sendError(ws, "Erro ao processar dados");
-      }
-    }
-  }
-
-  private setupConnectionHandlers(ws: WebSocket, botId: string): void {
-    this.metricsInterval = setInterval(() => {
-      if (this.webSocketUtils.isOpen(ws)) {
-        ws.ping();
-      } else {
-        this.cleanup();
-      }
+    // Ping interval
+    connection.pingInterval = setInterval(() => {
+      if (isWebSocketOpen(ws)) ws.ping();
+      else cleanup(botId);
     }, 30000);
 
+    // Adicionar verificação rápida para capturar status transitórios como "restarting"
+    const statusCheckInterval = setInterval(async () => {
+      if (!isWebSocketOpen(ws)) {
+        clearInterval(statusCheckInterval);
+        return;
+      }
 
-    const cleanup = () => {
-      console.log(`WebSocket métricas desconectado para bot: ${botId}`);
-      this.cleanup();
-    };
+      try {
+        const container = docker.getContainer(`bot-${botId}-container`);
+        const currentInfo = await container.inspect();
+        const currentStatus = currentInfo.State?.Status;
+        const previousStatus = connection.containerInfo?.State?.Status;
 
-    ws.on("close", cleanup);
-    ws.on("error", (err) => {
-      console.error(`Erro no WebSocket para bot ${botId}:`, err);
-      cleanup();
+        if (currentStatus !== previousStatus) {
+          console.log(
+            `🔍 Verificação de status: bot ${botId}: ${previousStatus} → ${currentStatus}`
+          );
+          connection.containerInfo = currentInfo;
+
+          // Enviar métricas atualizadas
+          if (connection.ws && isWebSocketOpen(connection.ws)) {
+            const statusMetrics = {
+              botId,
+              timestamp: new Date().toISOString(),
+              cpuPercent: "0.00",
+              memoryUsage: 0,
+              memoryLimit: 0,
+              memoryPercent: "0.00",
+              networkRx: 0,
+              networkTx: 0,
+              status: currentStatus,
+              uptime: formatUptime(currentInfo?.State?.StartedAt || ""),
+            };
+            sendMetrics(connection.ws, statusMetrics);
+          }
+        }
+      } catch (error) {
+        // Container pode não existir durante restart
+      }
+    }, 1000);
+
+    // Event handlers
+    ws.on("close", () => cleanup(botId));
+    ws.on("error", () => cleanup(botId));
+  } catch (error: any) {
+    sendError(ws, `Erro: ${error.message}`);
+    ws.close();
+  }
+}
+
+async function startMetricsStream(
+  botId: string,
+  container: Docker.Container
+): Promise<void> {
+  try {
+    const connection = activeConnections.get(botId);
+    if (!connection) return;
+
+    const rawStream = await container.stats({ stream: true });
+    connection.statsStream = rawStream as Readable;
+
+    connection.statsStream.on("data", (chunk: Buffer) => {
+      try {
+        const rawText = chunk.toString().trim();
+        if (!rawText) return;
+
+        // Docker pode enviar múltiplos JSONs separados por \n
+        const lines = rawText.split("\n").filter((line) => line.trim());
+
+        for (const line of lines) {
+          try {
+            const rawData = JSON.parse(line);
+            const metrics = processMetrics(
+              rawData,
+              botId,
+              connection.containerInfo
+            );
+            sendMetrics(connection.ws, metrics);
+          } catch (parseError) {
+            // Ignorar erros de parse
+          }
+        }
+      } catch (error) {
+        console.error(`Erro métricas bot ${botId}`);
+      }
     });
-  }
 
-  cleanup(): void {
-    if (this.statsStream?.destroy) {
-      this.statsStream.destroy();
-    }
-    if (this.metricsInterval) {
-      clearInterval(this.metricsInterval);
-    }
-    this.statsStream = null;
-    this.metricsInterval = null;
+    connection.statsStream.on("error", (error) => {
+      console.error(`❌ Erro na stream bot ${botId}:`, error);
+    });
+  } catch (error) {
+    console.error(`❌ Erro ao iniciar stream bot ${botId}:`, error);
   }
 }
 
-class MetricsRequestHandler {
-  private connectionManager: IConnectionManager;
-  private webSocketUtils: IWebSocketUtils;
+async function startDockerEventsStream(
+  botId: string,
+  containerId: string
+): Promise<void> {
+  try {
+    const connection = activeConnections.get(botId);
+    if (!connection) return;
 
-  constructor(
-    connectionManager: IConnectionManager,
-    webSocketUtils: IWebSocketUtils
-  ) {
-    this.connectionManager = connectionManager;
-    this.webSocketUtils = webSocketUtils;
-  }
+    const eventsStream = await docker.getEvents({
+      filters: {
+        container: [containerId],
+        event: [
+          "create",
+          "start",
+          "stop",
+          "restart",
+          "pause",
+          "unpause",
+          "die",
+          "kill",
+          "destroy",
+        ],
+      },
+    });
 
-  async handleWebSocketConnection(
-    ws: WebSocket,
-    req: IncomingMessage
-  ): Promise<void> {
-    const botId = this.extractBotId(req);
+    connection.eventsStream = eventsStream as Readable;
 
-    if (!botId) {
-      this.webSocketUtils.sendError(ws, "botId não fornecido");
-      return ws.close();
-    }
+    connection.eventsStream.on("data", async (chunk: Buffer) => {
+      try {
+        const rawText = chunk.toString().trim();
+        if (!rawText) return;
 
-    await this.connectionManager.handleConnection(ws, botId);
-  }
+        // Docker events também podem vir em múltiplas linhas
+        const lines = rawText.split("\n").filter((line) => line.trim());
 
-  private extractBotId(req: IncomingMessage): string | null {
-    const url = new URL(req.url || "", `http://${req.headers.host}`);
-    return url.searchParams.get("botId");
-  }
+        for (const line of lines) {
+          try {
+            const event = JSON.parse(line);
+            const container = docker.getContainer(containerId);
+            const updatedInfo = await container.inspect();
+
+            connection.containerInfo = updatedInfo;
+
+            if (connection.ws && isWebSocketOpen(connection.ws)) {
+              const currentMetrics = {
+                botId,
+                timestamp: new Date().toISOString(),
+                cpuPercent: "0.00",
+                memoryUsage: 0,
+                memoryLimit: 0,
+                memoryPercent: "0.00",
+                networkRx: 0,
+                networkTx: 0,
+                status: updatedInfo.State?.Status,
+                uptime: formatUptime(updatedInfo?.State?.StartedAt || ""),
+              };
+              sendMetrics(connection.ws, currentMetrics);
+            }
+          } catch (parseError) {
+            // Ignorar erros de parse
+          }
+        }
+      } catch (error) {}
+    });
+
+    connection.eventsStream.on("error", () => {});
+  } catch (error) {}
 }
 
-// FACTORY - Dependency Injection (Dependency Inversion)
-class MetricsServiceFactory {
-  static create(): MetricsRequestHandler {
-    const docker = new Docker();
-    const webSocketUtils = new WebSocketUtils();
-    const metricsProcessor = new ContainerMetricsProcessor();
-    const connectionManager = new MetricsConnectionManager(
-      docker,
-      metricsProcessor,
-      webSocketUtils
-    );
+function cleanup(botId: string): void {
+  const connection = activeConnections.get(botId);
+  if (!connection) return;
 
-    return new MetricsRequestHandler(connectionManager, webSocketUtils);
-  }
+  if (connection.statsStream) connection.statsStream.destroy();
+  if (connection.eventsStream) connection.eventsStream.destroy();
+  if (connection.pingInterval) clearInterval(connection.pingInterval);
+
+  activeConnections.delete(botId);
 }
-
-// BOOTSTRAP - Clean initialization
-const metricsService = MetricsServiceFactory.create();
 
 metricsWSS.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
-  await metricsService.handleWebSocketConnection(ws, req);
+  const url = new URL(req.url || "", `http://${req.headers.host}`);
+  const botId = url.searchParams.get("botId");
+
+  if (!botId) {
+    sendError(ws, "botId não fornecido");
+    ws.close();
+    return;
+  }
+
+  await handleMetricsConnection(ws, botId);
 });
 
-// WEBSOCKET UPGRADE HANDLER
 export function handleMetricsUpgrade(
   req: IncomingMessage,
   socket: Socket,
