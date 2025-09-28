@@ -15,61 +15,61 @@ interface ContainerMetrics {
   networkRx: number;
   networkTx: number;
   status: string;
+  running: boolean;
+  restarting: boolean;
+  paused: boolean;
   uptime: string;
+  restartCount: number;
 }
 
-function formatUptime(startedAt: string): string {
+interface Connection {
+  ws: WebSocket;
+  container: Docker.Container;
+  containerInfo: any;
+  statsStream?: Readable;
+  pingInterval?: NodeJS.Timeout;
+  statusInterval?: NodeJS.Timeout;
+  restartTimeout?: NodeJS.Timeout;
+  isRestarting?: boolean;
+}
+
+const docker = new Docker();
+const connections = new Map<string, Connection>();
+
+// Utilities
+const formatUptime = (startedAt: string): string => {
   if (!startedAt) return "0h 0m";
   const diff = Date.now() - new Date(startedAt).getTime();
   const hours = Math.floor(diff / (1000 * 60 * 60));
   const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
   return `${hours}h ${minutes}m`;
-}
+};
 
-function isWebSocketOpen(ws: WebSocket): boolean {
-  return ws.readyState === ws.OPEN;
-}
+const isOpen = (ws: WebSocket): boolean => ws.readyState === ws.OPEN;
 
-function sendError(ws: WebSocket, message: string): void {
-  if (!isWebSocketOpen(ws)) return;
-  ws.send(
-    JSON.stringify({ error: message, timestamp: new Date().toISOString() })
-  );
-}
+const send = (ws: WebSocket, data: any): void => {
+  if (isOpen(ws)) ws.send(JSON.stringify(data));
+};
 
-function sendMetrics(ws: WebSocket, metrics: ContainerMetrics): void {
-  if (!isWebSocketOpen(ws)) return;
-  ws.send(JSON.stringify(metrics));
-}
+const sendError = (ws: WebSocket, message: string): void => {
+  send(ws, { error: message, timestamp: new Date().toISOString() });
+};
 
-function processMetrics(
-  rawData: any,
-  botId: string,
-  containerInfo: any
-): ContainerMetrics {
+// Process metrics
+const processMetrics = (rawData: any, botId: string, containerInfo: any, isRestarting: boolean): ContainerMetrics => {
   // CPU
-  const cpuDelta =
-    rawData.cpu_stats.cpu_usage.total_usage -
-    (rawData.precpu_stats.cpu_usage?.total_usage || 0);
-  const systemCpuDelta =
-    rawData.cpu_stats.system_cpu_usage -
-    (rawData.precpu_stats.system_cpu_usage || 0);
-  const cpuPercent =
-    systemCpuDelta > 0 && cpuDelta >= 0
-      ? (cpuDelta / systemCpuDelta) * (rawData.cpu_stats.online_cpus || 1) * 100
-      : 0;
+  const cpuDelta = rawData.cpu_stats.cpu_usage.total_usage - (rawData.precpu_stats.cpu_usage?.total_usage || 0);
+  const systemDelta = rawData.cpu_stats.system_cpu_usage - (rawData.precpu_stats.system_cpu_usage || 0);
+  const cpuPercent = systemDelta > 0 ? (cpuDelta / systemDelta) * (rawData.cpu_stats.online_cpus || 1) * 100 : 0;
 
-  // Memória
+  // Memory
   const memoryUsage = rawData.memory_stats.usage || 0;
-  // Se o container estiver desligado, tente obter o limite de memória do containerInfo
-  const memoryLimit =
-    rawData.memory_stats.limit || containerInfo?.HostConfig?.Memory || 0;
+  const memoryLimit = rawData.memory_stats.limit || containerInfo?.HostConfig?.Memory || 0;
   const memoryPercent = memoryLimit > 0 ? (memoryUsage / memoryLimit) * 100 : 0;
 
-  // Rede
+  // Network
   const networks = rawData.networks || {};
-  let networkRx = 0,
-    networkTx = 0;
+  let networkRx = 0, networkTx = 0;
   Object.values(networks).forEach((network: any) => {
     networkRx += network.rx_bytes || 0;
     networkTx += network.tx_bytes || 0;
@@ -85,26 +85,120 @@ function processMetrics(
     networkRx,
     networkTx,
     status: containerInfo?.State?.Status || "unknown",
+    running: containerInfo?.State?.Running || false,
+    restarting: isRestarting || containerInfo?.State?.Restarting || false,
+    paused: containerInfo?.State?.Paused || false,
     uptime: formatUptime(containerInfo?.State?.StartedAt || ""),
+    restartCount: containerInfo?.RestartCount || 0,
   };
-}
+};
 
-const docker = new Docker();
-const activeConnections = new Map<
-  string,
-  {
-    ws: WebSocket;
-    statsStream?: Readable;
-    eventsStream?: Readable;
-    pingInterval?: NodeJS.Timeout;
-    containerInfo?: any;
-  }
->();
+// Start stats stream
+const startStatsStream = async (botId: string): Promise<void> => {
+  const connection = connections.get(botId);
+  if (!connection) return;
 
-async function handleMetricsConnection(
-  ws: WebSocket,
-  botId: string
-): Promise<void> {
+  try {
+    const rawStream = await connection.container.stats({ stream: true });
+    connection.statsStream = rawStream as Readable;
+
+    connection.statsStream.on("data", (chunk: Buffer) => {
+      const rawText = chunk.toString().trim();
+      if (!rawText) return;
+
+      const lines = rawText.split("\n").filter(line => line.trim());
+      for (const line of lines) {
+        try {
+          const rawData = JSON.parse(line);
+          const metrics = processMetrics(rawData, botId, connection.containerInfo, connection.isRestarting || false);
+          send(connection.ws, metrics);
+        } catch {}
+      }
+    });
+
+    connection.statsStream.on("error", () => {});
+  } catch {}
+};
+
+// Status polling for restart detection
+const startStatusPolling = (botId: string): void => {
+  const connection = connections.get(botId);
+  if (!connection) return;
+
+  connection.statusInterval = setInterval(async () => {
+    if (!isOpen(connection.ws)) {
+      cleanup(botId);
+      return;
+    }
+
+    try {
+      const info = await connection.container.inspect();
+      const wasRestarting = connection.isRestarting;
+      const isRestarting = info?.State?.Restarting || false;
+
+      if (isRestarting && !wasRestarting) {
+        connection.isRestarting = true;
+        
+        if (connection.restartTimeout) clearTimeout(connection.restartTimeout);
+        connection.restartTimeout = setTimeout(() => {
+          if (connection.isRestarting) connection.isRestarting = false;
+        }, 5000);
+
+        send(connection.ws, {
+          botId,
+          timestamp: new Date().toISOString(),
+          cpuPercent: "0.00",
+          memoryUsage: 0,
+          memoryLimit: 0,
+          memoryPercent: "0.00",
+          networkRx: 0,
+          networkTx: 0,
+          status: info?.State?.Status || "unknown",
+          running: info?.State?.Running || false,
+          restarting: true,
+          paused: info?.State?.Paused || false,
+          uptime: formatUptime(info?.State?.StartedAt || ""),
+          restartCount: info?.RestartCount || 0,
+        });
+      } else if (!isRestarting && wasRestarting) {
+        connection.isRestarting = false;
+        if (connection.restartTimeout) clearTimeout(connection.restartTimeout);
+      }
+
+      connection.containerInfo = info;
+    } catch {}
+  }, 1000);
+};
+
+// Ping interval
+const startPing = (botId: string): void => {
+  const connection = connections.get(botId);
+  if (!connection) return;
+
+  connection.pingInterval = setInterval(() => {
+    if (isOpen(connection.ws)) {
+      connection.ws.ping();
+    } else {
+      cleanup(botId);
+    }
+  }, 30000);
+};
+
+// Cleanup
+const cleanup = (botId: string): void => {
+  const connection = connections.get(botId);
+  if (!connection) return;
+
+  if (connection.statsStream) connection.statsStream.destroy();
+  if (connection.pingInterval) clearInterval(connection.pingInterval);
+  if (connection.statusInterval) clearInterval(connection.statusInterval);
+  if (connection.restartTimeout) clearTimeout(connection.restartTimeout);
+
+  connections.delete(botId);
+};
+
+// Handle new connection
+const handleConnection = async (ws: WebSocket, botId: string): Promise<void> => {
   try {
     const container = docker.getContainer(`bot-${botId}-container`);
     const containerInfo = await container.inspect();
@@ -115,199 +209,29 @@ async function handleMetricsConnection(
       return;
     }
 
-    const connection = {
+    const connection: Connection = {
       ws,
+      container,
       containerInfo,
-      statsStream: undefined as Readable | undefined,
-      eventsStream: undefined as Readable | undefined,
-      pingInterval: undefined as NodeJS.Timeout | undefined,
+      isRestarting: false
     };
-    activeConnections.set(botId, connection);
 
-    await startMetricsStream(botId, container);
-    await startDockerEventsStream(botId, containerInfo.Id);
+    connections.set(botId, connection);
 
-    // Ping interval
-    connection.pingInterval = setInterval(() => {
-      if (isWebSocketOpen(ws)) ws.ping();
-      else cleanup(botId);
-    }, 30000);
+    await startStatsStream(botId);
+    startStatusPolling(botId);
+    startPing(botId);
 
-    // Adicionar verificação rápida para capturar status transitórios como "restarting"
-    const statusCheckInterval = setInterval(async () => {
-      if (!isWebSocketOpen(ws)) {
-        clearInterval(statusCheckInterval);
-        return;
-      }
-
-      try {
-        const container = docker.getContainer(`bot-${botId}-container`);
-        const currentInfo = await container.inspect();
-        const currentStatus = currentInfo.State?.Status;
-        const previousStatus = connection.containerInfo?.State?.Status;
-
-        if (currentStatus !== previousStatus) {
-          console.log(
-            `🔍 Verificação de status: bot ${botId}: ${previousStatus} → ${currentStatus}`
-          );
-          connection.containerInfo = currentInfo;
-
-          // Enviar métricas atualizadas
-          if (connection.ws && isWebSocketOpen(connection.ws)) {
-            const statusMetrics = {
-              botId,
-              timestamp: new Date().toISOString(),
-              cpuPercent: "0.00",
-              memoryUsage: 0,
-              memoryLimit: 0,
-              memoryPercent: "0.00",
-              networkRx: 0,
-              networkTx: 0,
-              status: currentStatus,
-              uptime: formatUptime(currentInfo?.State?.StartedAt || ""),
-            };
-            sendMetrics(connection.ws, statusMetrics);
-          }
-        }
-      } catch (error) {
-        // Container pode não existir durante restart
-      }
-    }, 1000);
-
-    // Event handlers
     ws.on("close", () => cleanup(botId));
     ws.on("error", () => cleanup(botId));
+
   } catch (error: any) {
     sendError(ws, `Erro: ${error.message}`);
     ws.close();
   }
-}
+};
 
-async function startMetricsStream(
-  botId: string,
-  container: Docker.Container
-): Promise<void> {
-  try {
-    const connection = activeConnections.get(botId);
-    if (!connection) return;
-
-    const rawStream = await container.stats({ stream: true });
-    connection.statsStream = rawStream as Readable;
-
-    connection.statsStream.on("data", (chunk: Buffer) => {
-      try {
-        const rawText = chunk.toString().trim();
-        if (!rawText) return;
-
-        // Docker pode enviar múltiplos JSONs separados por \n
-        const lines = rawText.split("\n").filter((line) => line.trim());
-
-        for (const line of lines) {
-          try {
-            const rawData = JSON.parse(line);
-            const metrics = processMetrics(
-              rawData,
-              botId,
-              connection.containerInfo
-            );
-            sendMetrics(connection.ws, metrics);
-          } catch (parseError) {
-            // Ignorar erros de parse
-          }
-        }
-      } catch (error) {
-        console.error(`Erro métricas bot ${botId}`);
-      }
-    });
-
-    connection.statsStream.on("error", (error) => {
-      console.error(`❌ Erro na stream bot ${botId}:`, error);
-    });
-  } catch (error) {
-    console.error(`❌ Erro ao iniciar stream bot ${botId}:`, error);
-  }
-}
-
-async function startDockerEventsStream(
-  botId: string,
-  containerId: string
-): Promise<void> {
-  try {
-    const connection = activeConnections.get(botId);
-    if (!connection) return;
-
-    const eventsStream = await docker.getEvents({
-      filters: {
-        container: [containerId],
-        event: [
-          "create",
-          "start",
-          "stop",
-          "restart",
-          "pause",
-          "unpause",
-          "die",
-          "kill",
-          "destroy",
-        ],
-      },
-    });
-
-    connection.eventsStream = eventsStream as Readable;
-
-    connection.eventsStream.on("data", async (chunk: Buffer) => {
-      try {
-        const rawText = chunk.toString().trim();
-        if (!rawText) return;
-
-        // Docker events também podem vir em múltiplas linhas
-        const lines = rawText.split("\n").filter((line) => line.trim());
-
-        for (const line of lines) {
-          try {
-            const event = JSON.parse(line);
-            const container = docker.getContainer(containerId);
-            const updatedInfo = await container.inspect();
-
-            connection.containerInfo = updatedInfo;
-
-            if (connection.ws && isWebSocketOpen(connection.ws)) {
-              const currentMetrics = {
-                botId,
-                timestamp: new Date().toISOString(),
-                cpuPercent: "0.00",
-                memoryUsage: 0,
-                memoryLimit: 0,
-                memoryPercent: "0.00",
-                networkRx: 0,
-                networkTx: 0,
-                status: updatedInfo.State?.Status,
-                uptime: formatUptime(updatedInfo?.State?.StartedAt || ""),
-              };
-              sendMetrics(connection.ws, currentMetrics);
-            }
-          } catch (parseError) {
-            // Ignorar erros de parse
-          }
-        }
-      } catch (error) {}
-    });
-
-    connection.eventsStream.on("error", () => {});
-  } catch (error) {}
-}
-
-function cleanup(botId: string): void {
-  const connection = activeConnections.get(botId);
-  if (!connection) return;
-
-  if (connection.statsStream) connection.statsStream.destroy();
-  if (connection.eventsStream) connection.eventsStream.destroy();
-  if (connection.pingInterval) clearInterval(connection.pingInterval);
-
-  activeConnections.delete(botId);
-}
-
+// WebSocket setup
 metricsWSS.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
   const botId = url.searchParams.get("botId");
@@ -318,14 +242,10 @@ metricsWSS.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
     return;
   }
 
-  await handleMetricsConnection(ws, botId);
+  await handleConnection(ws, botId);
 });
 
-export function handleMetricsUpgrade(
-  req: IncomingMessage,
-  socket: Socket,
-  head: Buffer
-) {
+export function handleMetricsUpgrade(req: IncomingMessage, socket: Socket, head: Buffer) {
   metricsWSS.handleUpgrade(req, socket, head, (ws) => {
     metricsWSS.emit("connection", ws, req);
   });

@@ -6,9 +6,11 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
+    "@types/docker-events": "^0.0.3",
     "@types/swagger-jsdoc": "^6.0.4",
     "adm-zip": "^0.5.16",
     "cors": "^2.8.5",
+    "docker-events": "^0.0.2",
     "dockerode": "^4.0.8",
     "express": "^5.1.0",
     "multer": "^2.0.2",

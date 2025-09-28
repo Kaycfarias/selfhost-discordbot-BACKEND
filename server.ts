@@ -15,6 +15,8 @@ import { handleMetricsUpgrade } from "./routes/websocket-metrics";
 import uploadBotRoute from "./routes/upload-bot";
 import listBotsRoute from "./routes/list-bots";
 import stopBotContainerRoute from "./routes/stop-bot-container";
+import restartBotContainerRoute from "./routes/restart-bot-container";
+
 import swaggerUi from "swagger-ui-express";
 import swaggerDocs from "./utils/swaggerdocs";
 
@@ -26,6 +28,8 @@ app.use(express.json());
 app.use("/api", listBotsRoute);
 app.use("/api", uploadBotRoute);
 app.use("/api", stopBotContainerRoute);
+app.use("/api", restartBotContainerRoute);
+
 app.use("/", swaggerUi.serve, swaggerUi.setup(swaggerDocs));
 
 const server = http.createServer(app);
