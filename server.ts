@@ -16,7 +16,7 @@ import uploadBotRoute from "./routes/upload-bot";
 import listBotsRoute from "./routes/list-bots";
 import stopBotContainerRoute from "./routes/stop-bot-container";
 import restartBotContainerRoute from "./routes/restart-bot-container";
-
+import startBotContainerRoute from "./routes/start-bot-container";
 import swaggerUi from "swagger-ui-express";
 import swaggerDocs from "./utils/swaggerdocs";
 
@@ -29,6 +29,7 @@ app.use("/api", listBotsRoute);
 app.use("/api", uploadBotRoute);
 app.use("/api", stopBotContainerRoute);
 app.use("/api", restartBotContainerRoute);
+app.use("/api", startBotContainerRoute);
 
 app.use("/", swaggerUi.serve, swaggerUi.setup(swaggerDocs));
 

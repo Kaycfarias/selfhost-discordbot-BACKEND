@@ -3,7 +3,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs/promises";
 import AdmZip from "adm-zip";
-import { createAndRunBotContainer } from "./utils/dockerManager";
+import { createAndRunBotContainer } from "../utils/dockerManager";
 
 const router = Router();
 const upload = multer({ dest: "uploads/" });
