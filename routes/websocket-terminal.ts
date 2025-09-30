@@ -3,104 +3,90 @@ import { IncomingMessage } from "http";
 import { Socket } from "net";
 import Docker from "dockerode";
 import type { WebSocket } from "ws";
-import { PassThrough, Readable } from "stream";
+
+// Utils imports
+import type { TerminalConnection } from "../utils";
+import {
+  terminalError as sendError,
+  sendStatus,
+  cleanupTerminalConnection,
+  sendRecentLogs,
+  startLiveLogsStream,
+  startContainerMonitoring,
+} from "../utils";
 
 const docker = new Docker();
-const decoder = new TextDecoder("utf-8");
+const connections = new Map<string, TerminalConnection>();
 
-terminalWSS.on("connection", async (ws: WebSocket, req) => {
-  const botId = new URL(
-    req.url || "",
-    `http://${req.headers.host}`
-  ).searchParams.get("botId");
-
-  if (!botId) {
-    ws.send("[Erro] botId não fornecido");
-    return ws.close();
-  }
-
-  const container = docker.getContainer(`bot-${botId}-container`);
-
+// Handle new terminal connection
+const handleTerminalConnection = async (
+  ws: WebSocket,
+  botId: string
+): Promise<void> => {
   try {
-    const { State } = await container.inspect();
-    const isRunning = State.Running;
+    const container = docker.getContainer(`bot-${botId}-container`);
+    const containerInfo = await container.inspect();
 
+    if (!containerInfo?.State) {
+      sendError(ws, "Container não encontrado");
+      ws.close();
+      return;
+    }
+
+    const connection: TerminalConnection = {
+      ws,
+      container,
+      botId,
+      isRunning: containerInfo.State.Running,
+    };
+
+    connections.set(botId, connection);
+
+    // Always send recent logs first
     await sendRecentLogs(container, ws);
 
-    if (!isRunning) {
-      ws.send("[Bot parado]");
-      return ws.close();
+    if (connection.isRunning) {
+      sendStatus(ws, "Conectado - Transmitindo logs em tempo real");
+      await startLiveLogsStream(connection);
+    } else {
+      sendStatus(ws, "Bot parado - Aguardando inicialização...");
+      await startContainerMonitoring(connection);
     }
 
-    await streamLiveLogs(container, ws);
-  } catch (err: any) {
-    ws.send(`[Erro] Não foi possível acessar o container: ${err.message}`);
+    // Setup cleanup on disconnect
+    ws.on("close", () => {
+      const conn = connections.get(botId);
+      if (conn) {
+        cleanupTerminalConnection(conn);
+        connections.delete(botId);
+      }
+    });
+
+    ws.on("error", () => {
+      const conn = connections.get(botId);
+      if (conn) {
+        cleanupTerminalConnection(conn);
+        connections.delete(botId);
+      }
+    });
+  } catch (error: any) {
+    sendError(ws, `Não foi possível acessar o container: ${error.message}`);
     ws.close();
   }
+};
+
+terminalWSS.on("connection", async (ws: WebSocket, req) => {
+  const url = new URL(req.url || "", `http://${req.headers.host}`);
+  const botId = url.searchParams.get("botId");
+
+  if (!botId) {
+    sendError(ws, "botId não fornecido");
+    ws.close();
+    return;
+  }
+
+  await handleTerminalConnection(ws, botId);
 });
-
-async function sendRecentLogs(container: Docker.Container, ws: WebSocket) {
-  const buffer = await container.logs({
-    follow: false,
-    stdout: true,
-    stderr: true,
-    tail: 100,
-  });
-  const bufferStream = new Readable();
-  bufferStream.push(buffer);
-  bufferStream.push(null);
-
-  const stdout = new PassThrough();
-  const stderr = new PassThrough();
-
-  container.modem.demuxStream(bufferStream, stdout, stderr);
-
-  const sendChunk = (chunk: Buffer) => ws.send(decoder.decode(chunk));
-  stdout.on("data", sendChunk);
-  stderr.on("data", sendChunk);
-
-  await new Promise<void>((resolve) => {
-    bufferStream.on("end", resolve);
-  });
-}
-
-async function streamLiveLogs(container: Docker.Container, ws: WebSocket) {
-  const stream = (await container.logs({
-    follow: true,
-    stdout: true,
-    stderr: true,
-    tail: 0,
-  })) as Readable;
-
-  const stdout = new PassThrough();
-  const stderr = new PassThrough();
-
-  container.modem.demuxStream(stream, stdout, stderr);
-
-  const sendChunk = (chunk: Buffer) => ws.send(decoder.decode(chunk));
-  stdout.on("data", sendChunk);
-  stderr.on("data", sendChunk);
-
-  container.wait().then(() => {
-    if (ws.readyState === ws.OPEN) {
-      ws.send("[Bot parado]\n\r\n\r\n");
-      ws.close();
-    }
-  });
-
-  const cleanup = () => {
-    stream.destroy?.();
-    ws.close();
-  };
-
-  stream.on("error", (err) => {
-    ws.send(`[Erro] Falha ao ler logs: ${err.message}`);
-    ws.close();
-  });
-
-  ws.on("close", cleanup);
-  ws.on("error", cleanup);
-}
 
 export function handleTerminalUpgrade(
   req: IncomingMessage,

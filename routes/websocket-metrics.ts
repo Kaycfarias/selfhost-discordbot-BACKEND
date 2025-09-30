@@ -7,7 +7,7 @@ import type { WebSocket } from "ws";
 // Utils imports
 import type { Connection } from "../utils";
 import {
-  sendError,
+  wsError as sendError,
   cleanup as cleanupConnection,
   isOpen,
   startEventsStream,
